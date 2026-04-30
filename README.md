@@ -26,9 +26,22 @@ graph TD
 
 ---
 
-### ¿Cómo funciona la comunicación?
-- **Red Aislada (`inventario-net`)**: Docker crea una red privada virtual exclusiva para tu proyecto. Esto genera un "DNS interno". Gracias a esto, tu Backend puede conectarse a la base de datos simplemente usando la palabra `db` en lugar de una dirección IP numérica.
-- **Volúmenes (`db-data`)**: Los contenedores son efímeros (si se borran, se pierde todo su contenido). Para evitar que los datos de MySQL desaparezcan al apagar el contenedor, se usa un **Volumen**. Este disco virtual guarda los datos de forma permanente en tu computadora física.
+### ¿Cómo se comunican los contenedores y cómo funciona la Red Privada?
+
+1. **La Red Privada (`inventario-net`)**
+   Al levantar el proyecto, Docker no conecta tus contenedores directamente al internet público. En su lugar, crea una **red virtual privada tipo puente (bridge)** exclusiva para tu proyecto. Piensa en esta red como un router WiFi virtual al que solo están conectados el Frontend, el Backend y la Base de Datos. Ningún contenedor externo puede entrar a esta red.
+
+2. **Resolución de Nombres (DNS Interno de Docker)**
+   Dentro de esta red privada, Docker asigna automáticamente una dirección IP a cada contenedor, pero las IPs pueden cambiar cada vez que se reinicia el proyecto. Para solucionar esto, Docker incluye un **servidor DNS interno**. Gracias a esto, los contenedores se pueden comunicar usando sus "nombres de servicio" (definidos en el `docker-compose.yml`) en lugar de direcciones IP numéricas.
+   - El **Backend** se conecta a la base de datos simplemente llamando a la ruta `jdbc:mysql://db:3306`. Docker automáticamente traduce la palabra `db` a la IP actual del contenedor de MySQL.
+   - El **Frontend** (Nginx) se comunica internamente con el Backend usando la ruta del contenedor (aunque en este proyecto específico, como el Frontend corre en el navegador del usuario final, las llamadas a la API se hacen a `http://localhost:5000` que es el puerto expuesto del Backend hacia tu computadora física).
+
+3. **¿Quién aloja a los contenedores? (El mito del "Contenedor Principal")**
+   Es común pensar que hay un "contenedor principal" gigante que tiene a los demás adentro, pero no es así. En realidad, quien aloja y maneja a todos los contenedores es el **Docker Engine** (el motor de Docker instalado en tu computadora o servidor físico). 
+   - El **Docker Compose** no es un contenedor, sino una *herramienta de orquestación*. Funciona como el "director de orquesta" que lee las instrucciones y le dice al Docker Engine: *"Crea esta red, levanta la base de datos, luego el backend y finalmente el frontend, y conéctalos todos a la misma red"*. Todos los contenedores corren como procesos paralelos al mismo nivel, compartiendo los recursos (CPU y RAM) del servidor físico que los hospeda (Host).
+
+### Persistencia de la Información
+- **Volúmenes (`db-data`)**: Los contenedores son efímeros (si se borran o actualizan, se pierde todo su contenido interno). Para evitar que los datos de MySQL desaparezcan al apagar el contenedor, se usa un **Volumen**. Un volumen es un disco virtual que Docker crea y guarda de forma permanente y segura en tu disco duro físico, vinculándolo al contenedor de la base de datos.
 
 ---
 
@@ -62,39 +75,50 @@ A continuación, analizamos a fondo qué hace cada archivo que construye tu proy
 Utiliza **Multi-stage build**. Esto significa que primero usa una computadora con Node.js para compilar (ensamblar) el código, y luego bota esa computadora y solo se queda con el HTML/CSS resultante metido en un servidor web ultraligero (Nginx).
 
 ```dockerfile
-# ── ETAPA 1: BUILD ──
-# 1. Traemos una imagen base con Node.js (versión ligera Alpine). La llamamos "build".
+# ===========================================================
+# DOCKERFILE FRONTEND - Sistema de Inventarios Petyzoos
+# Multi-stage build: Angular 21 → Nginx Alpine
+# ===========================================================
+
+# ── STAGE 1: BUILD ──────────────────────────────────────────
+# Usamos node:22-alpine como imagen base para compilar Angular.
+# Alpine reduce el tamaño de imagen significativamente vs Debian.
 FROM node:22-alpine AS build
 
-# 2. Entramos a una carpeta "/app" dentro de la computadora virtual.
+# Directorio de trabajo dentro del contenedor
 WORKDIR /app
 
-# 3. Copiamos SOLO la lista de librerías. (Truco para que Docker guarde esto en memoria caché).
+# Copiamos primero package.json y package-lock.json para aprovechar
+# la caché de Docker layers. Si no cambian, npm ci no se re-ejecuta.
 COPY package.json package-lock.json ./
 
-# 4. Instalamos las dependencias de forma limpia y rápida.
+# Instalamos dependencias sin caché innecesario (--no-cache)
+# npm ci es más rápido y determinista que npm install
 RUN npm ci --no-audit --no-fund
 
-# 5. Copiamos todo el resto del código fuente del frontend.
+# Ahora copiamos el resto del código fuente
 COPY . .
 
-# 6. Compilamos Angular para producción. (Se generan los archivos listos para internet).
+# Compilamos la aplicación Angular en modo producción
+# Esto genera archivos estáticos en dist/frontend-inventario/browser/
 RUN npx ng build --configuration production
 
-# ── ETAPA 2: PRODUCCIÓN ──
-# 7. Desechamos Node.js y traemos Nginx (servidor web súper veloz y ligero).
+# ── STAGE 2: PRODUCCIÓN ────────────────────────────────────
+# Usamos nginx:alpine para servir los archivos estáticos.
+# La imagen de nginx:alpine pesa ~40MB vs ~140MB de nginx:latest
 FROM nginx:alpine AS production
 
-# 8. Copiamos nuestra configuración de rutas personalizada para el servidor.
+# Copiamos la configuración personalizada de Nginx
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 
-# 9. ¡EL PASO CLAVE! Rescatamos los archivos HTML/JS generados en la "ETAPA 1" y los ponemos en la carpeta pública de Nginx.
+# Copiamos los archivos compilados de Angular desde el stage anterior
+# Angular 21 genera los archivos en dist/<nombre-proyecto>/browser/
 COPY --from=build /app/dist/frontend-inventario/browser /usr/share/nginx/html
 
-# 10. Avisamos que este contenedor recibirá visitas por el puerto 80.
+# Exponemos el puerto 80 (Nginx)
 EXPOSE 80
 
-# 11. Encendemos el servidor web para que nunca se apague.
+# Comando por defecto para ejecutar Nginx en primer plano
 CMD ["nginx", "-g", "daemon off;"]
 ```
 
@@ -102,86 +126,150 @@ CMD ["nginx", "-g", "daemon off;"]
 Al igual que el Frontend, utiliza múltiples etapas para no enviar al servidor final herramientas de compilación pesadas, reduciendo el tamaño de la imagen.
 
 ```dockerfile
-# ── ETAPA 1: BUILD ──
-# 1. Traemos una imagen con Maven y Java 21 para poder compilar.
+# ===========================================================
+# DOCKERFILE BACKEND - Sistema de Inventarios Petyzoos
+# Multi-stage build: Maven + JDK 21 → JRE 21 Alpine
+# ===========================================================
+
+# ── STAGE 1: BUILD ──────────────────────────────────────────
+# Usamos maven con Eclipse Temurin JDK 21 para compilar
 FROM maven:3.9-eclipse-temurin-21-alpine AS build
 
-# 2. Entramos a la carpeta de trabajo.
+# Directorio de trabajo
 WORKDIR /app
 
-# 3. Copiamos la configuración de librerías.
+# Copiamos primero pom.xml para aprovechar caché de dependencias
 COPY pom.xml .
 COPY .mvn .mvn
 COPY mvnw .
 
-# 4. Descargamos las librerías de internet.
+# Descargamos dependencias sin compilar el código (cache de layers)
 RUN mvn dependency:go-offline -B
 
-# 5. Copiamos nuestro código fuente Java.
+# Copiamos el código fuente
 COPY src ./src
 
-# 6. Compilamos todo nuestro código en un archivo ".jar". Nos saltamos los tests por rapidez.
+# Compilamos el proyecto, saltando tests para agilizar el build
+# --no-transfer-progress reduce la salida del log
 RUN mvn clean package -DskipTests --no-transfer-progress
 
-# ── ETAPA 2: PRODUCCIÓN ──
-# 7. Desechamos Maven y traemos un "JRE" (Solo lo estrictamente necesario para correr Java).
+# ── STAGE 2: PRODUCCIÓN ────────────────────────────────────
+# Usamos JRE Alpine para reducir el tamaño final (~200MB vs ~600MB)
 FROM eclipse-temurin:21-jre-alpine AS production
 
-# 8. Entramos a la carpeta final de trabajo.
+# Directorio de trabajo
 WORKDIR /app
 
-# 9. Por medidas de ciberseguridad, creamos un usuario común (no administrador).
+# Creamos usuario no-root para seguridad
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 
-# 10. Rescatamos el archivo ".jar" de la ETAPA 1.
+# Copiamos el JAR compilado desde el stage de build
 COPY --from=build /app/target/*.jar app.jar
 
-# 11. Le damos permiso al nuevo usuario para manejar este archivo.
+# Cambiamos permisos del JAR al usuario no-root
 RUN chown appuser:appgroup app.jar
 
-# 12. A partir de aquí, ejecutamos todo con ese usuario seguro.
+# Cambiamos al usuario no-root
 USER appuser
 
-# 13. Avisamos que el backend atiende por el puerto 8080.
+# Exponemos el puerto del backend (Spring Boot)
 EXPOSE 8080
 
-# 14. HEALTHCHECK: Cada 30s Docker se asegura que el backend siga vivo haciéndole ping a la ruta /api/dashboard.
+# HEALTHCHECK: Verifica que el backend responda cada 30 segundos
+# Se usa wget porque curl no está disponible en Alpine por defecto
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD wget --no-verbose --tries=1 --spider http://localhost:8080/api/dashboard || exit 1
 
-# 15. Encendemos el servidor y le avisamos que use la configuración especial de Docker.
+# Comando de ejecución con perfil Docker activado
 CMD ["java", "-jar", "app.jar", "--spring.profiles.active=docker"]
 ```
 
-### C. Base de Datos (MySQL) - Directamente en `docker-compose.yml`
-La base de datos **no necesita un Dockerfile** porque no compilamos código propio; solo configuramos un programa ya existente. Todo se define en el archivo `docker-compose.yml`:
+### C. Archivo `docker-compose.yml` (Orquestación y Base de Datos)
+La base de datos **no necesita un Dockerfile** porque no compilamos código propio; solo configuramos la imagen oficial de MySQL. Todo, junto con la conexión de los servicios, se define en el archivo principal `docker-compose.yml`:
 
 ```yaml
+# ================================================================
+# DOCKER COMPOSE - Sistema de Inventarios Petyzoos
+# Orquesta 3 servicios: frontend, backend y base de datos MySQL
+# Versión mínima: 3.8
+# ================================================================
+services:
+  # ─── FRONTEND (Angular + Nginx) ─────────────────────────────
+  frontend:
+    build:
+      context: ./frontend-inventario
+      dockerfile: Dockerfile
+    container_name: petyzoos-frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"     # Publica puerto 3000 → Nginx:80
+    depends_on:
+      - backend                          # Espera a que backend inicie
+    networks:
+      - inventario-net                   # Red personalizada
+    restart: unless-stopped
+
+  # ─── BACKEND (Spring Boot + JRE 21) ────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: petyzoos-backend
+    ports:
+      - "${BACKEND_PORT:-5000}:8080"    # Publica puerto 5000 → Spring:8080
+    env_file:
+      - .env                            # Variables de entorno desde archivo
+    environment:
+      - SPRING_PROFILES_ACTIVE=docker   # Activa perfil Docker
+    depends_on:
+      db:
+        condition: service_healthy       # Espera a que MySQL pase healthcheck
+    networks:
+      - inventario-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/api/dashboard"]
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 3
+
+  # ─── BASE DE DATOS (MySQL 8) ───────────────────────────────
   db:
-    # 1. Descarga el programa MySQL versión 8 directo de internet.
-    image: mysql:8.0                     
-    
-    # 2. Le inyecta contraseñas y configuraciones iniciales.
+    image: mysql:8.0                     # Imagen oficial de MySQL
+    container_name: petyzoos-db
+    env_file:
+      - .env
     environment:
       MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASS}
       MYSQL_DATABASE: ${DB_NAME}
-      # ...
-      
-    # 3. Expone el puerto por el que se conectan los clientes SQL (ej. DBeaver).
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASS}
     ports:
-      - "${DB_PORT:-3306}:3306"          
-      
-    # 4. Configuración de discos virtuales.
+      - "${DB_PORT:-3306}:3306"          # Publica puerto 3306
     volumes:
-      # Guarda los datos físicamente para no perderlos si el contenedor se apaga.
-      - db-data:/var/lib/mysql           
-      
-      # Inyecta tu script "init.sql". MySQL lo detecta y lo ejecuta automáticamente la 1ra vez, creando tus tablas sin que tú muevas un dedo.
-      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql  
-      
-    # 5. Verifica que la BD esté encendida antes de que el Backend intente conectarse.
+      - db-data:/var/lib/mysql           # Volumen persistente para datos
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql  # Script de inicialización
+    networks:
+      - inventario-net
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${DB_ROOT_PASS}"]
+      interval: 15s
+      timeout: 10s
+      start_period: 30s
+      retries: 5
+    command: --default-authentication-plugin=caching_sha2_password
+
+# ─── VOLÚMENES NOMBRADOS ─────────────────────────────────────
+volumes:
+  db-data:
+    name: petyzoos-db-data               # Nombre explícito del volumen
+
+# ─── REDES PERSONALIZADAS ────────────────────────────────────
+networks:
+  inventario-net:
+    name: petyzoos-network               # Nombre explícito de la red
+    driver: bridge                       # Driver de red bridge
 ```
 
 > [!NOTE]
